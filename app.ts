@@ -29,6 +29,7 @@ import { handleRest } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { handleGit } from './gitproto.ts';
+import { bearerHeader, EMPTY_BODY, isBodylessRequest } from './perf.ts';
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
@@ -46,13 +47,27 @@ function sendUnauthorized(res: ServerResponse): void {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Readonly<Record<string, string>> = {}): void {
-  const text = body === null ? '' : JSON.stringify(body);
+  const text = body === null || body === undefined ? '' : JSON.stringify(body) ?? '';
+  // Content-Length up front: without it Node falls back to chunked
+  // encoding, which costs framing on every response.
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
+    'content-length': String(Buffer.byteLength(text)),
     'x-github-request-id': requestId(),
     ...extraHeaders,
   });
   res.end(text);
+}
+
+/** Send a pre-serialized JSON body (its bytes are already exact). */
+function sendRaw(res: ServerResponse, status: number, bytes: Buffer, extraHeaders: Readonly<Record<string, string>> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': String(bytes.length),
+    'x-github-request-id': requestId(),
+    ...extraHeaders,
+  });
+  res.end(bytes);
 }
 
 function sendBytes(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
@@ -93,10 +108,10 @@ function parseJsonBody(raw: Buffer): unknown {
   }
 }
 
-function authorized(req: IncomingMessage, expectedToken: string | undefined): boolean {
+function authorized(req: IncomingMessage, expectedToken: string | undefined, expectedBearer: string): boolean {
   if (expectedToken === undefined || expectedToken === '') return false;
   const header = req.headers.authorization ?? '';
-  if (header === `Bearer ${expectedToken}`) return true;
+  if (expectedBearer !== '' && header === expectedBearer) return true;
   // Real git (and curl -u) speak Basic: the token rides as the password,
   // e.g. `https://x-access-token:<token>@host/...`. The suite's own
   // clients always send Bearer; this only makes the forge behave like
@@ -115,8 +130,9 @@ function authorized(req: IncomingMessage, expectedToken: string | undefined): bo
 
 /** Build the server. `expectedToken` is the bearer token the suite issued. */
 export function createApp(store: Store, expectedToken: string | undefined) {
+  const expectedBearer = bearerHeader(expectedToken);
   const server = createServer((req, res) => {
-    void handleRequest(store, expectedToken, req, res).catch((err: unknown) => {
+    void handleRequest(store, expectedToken, expectedBearer, req, res).catch((err: unknown) => {
       if (!res.writableEnded) {
         const message = err instanceof Error ? err.message : 'internal error';
         console.error(`[forge] unhandled error: ${message}`);
@@ -130,6 +146,7 @@ export function createApp(store: Store, expectedToken: string | undefined) {
 async function handleRequest(
   store: Store,
   expectedToken: string | undefined,
+  expectedBearer: string,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -138,6 +155,9 @@ async function handleRequest(
   const method = req.method ?? 'GET';
   const segments = url.pathname.split('/').filter((part) => part !== '');
   const query = url.searchParams;
+  // A request that cannot carry a body must not wait for the stream's
+  // `end` event: that wait is a whole event-loop turn per request.
+  const bodyless = isBodylessRequest(req);
 
   try {
     // -- health --------------------------------------------------------------
@@ -149,7 +169,7 @@ async function handleRequest(
     // -- GraphQL --------------------------------------------------------------
     if (url.pathname === '/api/graphql') {
       if (method !== 'POST') throw new ApiError(404, 'Not Found');
-      if (!authorized(req, expectedToken)) {
+      if (!authorized(req, expectedToken, expectedBearer)) {
         sendUnauthorized(res);
         return;
       }
@@ -162,11 +182,11 @@ async function handleRequest(
 
     // -- MCP ------------------------------------------------------------------
     if (url.pathname === '/mcp') {
-      if (!authorized(req, expectedToken)) {
+      if (!authorized(req, expectedToken, expectedBearer)) {
         sendUnauthorized(res);
         return;
       }
-      const raw = await readBody(req);
+      const raw = bodyless ? EMPTY_BODY : await readBody(req);
       const answer = handleMcp(store, method, raw);
       if (answer.body === '') {
         res.writeHead(answer.status, { 'x-github-request-id': requestId() });
@@ -182,16 +202,20 @@ async function handleRequest(
       const restSegments = segments.slice(2);
       const isRoot = restSegments.length === 0;
       const isMeta = restSegments.length === 1 && restSegments[0] === 'meta';
-      if (!isRoot && !isMeta && !authorized(req, expectedToken)) {
+      if (!isRoot && !isMeta && !authorized(req, expectedToken, expectedBearer)) {
         sendUnauthorized(res);
         return;
       }
-      const raw = await readBody(req);
+      const raw = bodyless ? EMPTY_BODY : await readBody(req);
       const body = parseJsonBody(raw);
       const answer = handleRest(store, method, restSegments, query, body, baseUrl, url.pathname);
       if (answer.status === 204) {
         res.writeHead(204, { 'x-github-request-id': requestId() });
         res.end();
+        return;
+      }
+      if (answer.raw !== undefined) {
+        sendRaw(res, answer.status, answer.raw, answer.headers ?? {});
         return;
       }
       sendJson(res, answer.status, answer.body, answer.headers ?? {});
@@ -200,7 +224,7 @@ async function handleRequest(
 
     // -- git smart HTTP --------------------------------------------------------
     if (segments.length >= 2 && segments[1]!.endsWith('.git')) {
-      if (!authorized(req, expectedToken)) {
+      if (!authorized(req, expectedToken, expectedBearer)) {
         sendUnauthorized(res);
         return;
       }
@@ -210,7 +234,7 @@ async function handleRequest(
       const headers: Record<string, string | undefined> = {
         'git-protocol': req.headers['git-protocol'],
       };
-      const raw = await readBody(req);
+      const raw = bodyless ? EMPTY_BODY : await readBody(req);
       const answer = handleGit(store, owner, repoName, subpath, method, query, headers, raw);
       sendBytes(res, answer.status, answer.contentType, answer.body);
       return;

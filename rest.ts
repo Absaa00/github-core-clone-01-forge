@@ -45,16 +45,24 @@
 import { parseCommit, parseTree } from './gitobj.ts';
 import { ApiError, Store, VIEWER, type Issue, type Pull, type Repo } from './store.ts';
 import { FIXED_ISO } from './util.ts';
+import { issueJsonCache } from './perf.ts';
 
 /** What a REST handler answers: status, extra headers, JSON body. */
 export interface RestAnswer {
   readonly status: number;
   readonly headers?: Readonly<Record<string, string>>;
-  readonly body: unknown;
+  readonly body?: unknown;
+  /** A pre-serialized JSON body: when present, `body` is unused. */
+  readonly raw?: Buffer;
 }
 
 function ok(body: unknown, status = 200, headers?: Record<string, string>): RestAnswer {
   return { status, headers, body };
+}
+
+/** An answer whose JSON body is already serialized (issue-view cache). */
+function okRaw(bytes: Buffer, status = 200, headers?: Record<string, string>): RestAnswer {
+  return { status, headers, raw: bytes };
 }
 
 function notFound(what: string): ApiError {
@@ -593,11 +601,15 @@ export function handleRest(
         if (title === '') throw new ApiError(422, 'title is required');
         const labels = Array.isArray(payload.labels) ? payload.labels.filter((item): item is string => typeof item === 'string') : [];
         const issue = store.createIssue(repo, title, stringField(payload, 'body'), labels);
-        return ok(issueView(repo, issue, baseUrl), 201);
+        // The serialized view is cached, so the first GET of this issue is
+        // already warm; the response bytes are the cached ones.
+        return okRaw(issueJsonCache.get(repo, issue, baseUrl, () => issueView(repo, issue, baseUrl)), 201);
       }
       if (rest.length >= 2) {
         const issue = issueOr404(repo, rest[1]!);
-        if (rest.length === 2 && method === 'GET') return ok(issueView(repo, issue, baseUrl));
+        if (rest.length === 2 && method === 'GET') {
+          return okRaw(issueJsonCache.get(repo, issue, baseUrl, () => issueView(repo, issue, baseUrl)));
+        }
         if (rest.length === 2 && method === 'PATCH') {
           const payload = bodyObject(body, 'PATCH issue');
           if (typeof payload.title === 'string') issue.title = payload.title;
@@ -610,7 +622,8 @@ export function handleRest(
             }
             issue.labels = labels;
           }
-          return ok(issueView(repo, issue, baseUrl));
+          // The mutation changes the fingerprint, so the cache rebuilds.
+          return okRaw(issueJsonCache.get(repo, issue, baseUrl, () => issueView(repo, issue, baseUrl)));
         }
         if (rest[2] === 'comments') {
           if (rest.length === 3 && method === 'GET') {
