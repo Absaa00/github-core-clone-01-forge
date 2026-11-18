@@ -69,22 +69,27 @@ function notFound(what: string): ApiError {
   return new ApiError(404, `${what} not found`);
 }
 
-/** The viewer's public user object. */
-function userView(): Record<string, unknown> {
-  return {
-    login: VIEWER.login,
-    id: VIEWER.id,
-    avatar_url: `https://avatars.githubusercontent.com/u/${VIEWER.id}?v=4`,
-    type: 'User',
-    site_admin: false,
-    name: VIEWER.name,
-    email: VIEWER.email,
-    html_url: `https://github.com/${VIEWER.login}`,
-    url: `/api/v3/users/${VIEWER.login}`,
-    created_at: FIXED_ISO,
-    updated_at: FIXED_ISO,
-  };
-}
+/**
+ * The viewer's public user object. It is fully constant (fixed identity and
+ * fixed timestamps), so one frozen object is shared by every view that
+ * embeds it instead of rebuilding the same object per response — the write
+ * workload builds one issue view per request, and the pull views embed it
+ * three times each. The object is frozen and only ever stringified, never
+ * mutated, so sharing it cannot change a response byte.
+ */
+const USER_VIEW: Record<string, unknown> = Object.freeze({
+  login: VIEWER.login,
+  id: VIEWER.id,
+  avatar_url: `https://avatars.githubusercontent.com/u/${VIEWER.id}?v=4`,
+  type: 'User',
+  site_admin: false,
+  name: VIEWER.name,
+  email: VIEWER.email,
+  html_url: `https://github.com/${VIEWER.login}`,
+  url: `/api/v3/users/${VIEWER.login}`,
+  created_at: FIXED_ISO,
+  updated_at: FIXED_ISO,
+});
 
 /** Parse `Name <email> 1234567890 +0000` into GitHub's author shape. */
 function authorView(line: string): Record<string, unknown> {
@@ -100,7 +105,7 @@ function repoView(repo: Repo, baseUrl: string): Record<string, unknown> {
     id: repo.id,
     name: repo.name,
     full_name: `${owner}/${repo.name}`,
-    owner: userView(),
+    owner: USER_VIEW,
     private: repo.private,
     html_url: `${baseUrl}/${owner}/${repo.name}`,
     description: repo.description,
@@ -127,7 +132,7 @@ function issueView(repo: Repo, issue: Issue, baseUrl: string): Record<string, un
     state: issue.state,
     locked: false,
     labels: issue.labels.map((name) => ({ name, color: repo.labels.get(name)?.color ?? 'ededed' })),
-    user: userView(),
+    user: USER_VIEW,
     assignee: null,
     comments: issue.comments.length,
     created_at: FIXED_ISO,
@@ -144,7 +149,7 @@ function commentView(repo: Repo, comment: { id: number; body: string }, issueNum
   return {
     id: comment.id,
     body: comment.body,
-    user: userView(),
+    user: USER_VIEW,
     created_at: FIXED_ISO,
     updated_at: FIXED_ISO,
     url: `${baseUrl}/api/v3/repos/${VIEWER.login}/${repo.name}/issues/${issueNumber}/comments/${comment.id}`,
@@ -168,9 +173,9 @@ function pullView(store: Store, repo: Repo, pull: Pull, baseUrl: string): Record
     mergeable: pull.state === 'open' ? !store.isConflicted(repo, pull) : null,
     merged_at: pull.mergedAt,
     merge_commit_sha: pull.mergeCommitSha,
-    head: { label: `${VIEWER.login}:${pull.headRef}`, ref: pull.headRef, sha: headSha, user: userView() },
-    base: { label: `${VIEWER.login}:${pull.baseRef}`, ref: pull.baseRef, sha: baseSha, user: userView() },
-    user: userView(),
+    head: { label: `${VIEWER.login}:${pull.headRef}`, ref: pull.headRef, sha: headSha, user: USER_VIEW },
+    base: { label: `${VIEWER.login}:${pull.baseRef}`, ref: pull.baseRef, sha: baseSha, user: USER_VIEW },
+    user: USER_VIEW,
     created_at: FIXED_ISO,
     updated_at: FIXED_ISO,
     closed_at: pull.state === 'closed' ? (pull.mergedAt ?? FIXED_ISO) : null,
@@ -440,7 +445,7 @@ export function handleRest(
   // -- the viewer ------------------------------------------------------------
   if (segments[0] === 'user' && segments.length === 1) {
     if (method !== 'GET') throw new ApiError(404, 'Not Found');
-    return ok(userView());
+    return ok(USER_VIEW);
   }
   if (segments[0] === 'user' && segments[1] === 'repos' && segments.length === 2) {
     if (method === 'GET') {

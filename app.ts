@@ -29,7 +29,7 @@ import { handleRest } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { handleGit } from './gitproto.ts';
-import { bearerHeader, EMPTY_BODY, isBodylessRequest } from './perf.ts';
+import { bearerHeader, EMPTY_BODY, isBodylessRequest, parseRequestTarget } from './perf.ts';
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
@@ -49,24 +49,28 @@ function sendUnauthorized(res: ServerResponse): void {
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Readonly<Record<string, string>> = {}): void {
   const text = body === null || body === undefined ? '' : JSON.stringify(body) ?? '';
   // Content-Length up front: without it Node falls back to chunked
-  // encoding, which costs framing on every response.
-  res.writeHead(status, {
+  // encoding, which costs framing on every response. The headers object
+  // is built without a spread when there are no extras (the common case):
+  // spreading `{}` still allocates and copies per response.
+  const headers: Record<string, string> = {
     'content-type': 'application/json; charset=utf-8',
     'content-length': String(Buffer.byteLength(text)),
     'x-github-request-id': requestId(),
-    ...extraHeaders,
-  });
+  };
+  for (const key of Object.keys(extraHeaders)) headers[key] = extraHeaders[key]!;
+  res.writeHead(status, headers);
   res.end(text);
 }
 
 /** Send a pre-serialized JSON body (its bytes are already exact). */
 function sendRaw(res: ServerResponse, status: number, bytes: Buffer, extraHeaders: Readonly<Record<string, string>> = {}): void {
-  res.writeHead(status, {
+  const headers: Record<string, string> = {
     'content-type': 'application/json; charset=utf-8',
     'content-length': String(bytes.length),
     'x-github-request-id': requestId(),
-    ...extraHeaders,
-  });
+  };
+  for (const key of Object.keys(extraHeaders)) headers[key] = extraHeaders[key]!;
+  res.writeHead(status, headers);
   res.end(bytes);
 }
 
@@ -150,24 +154,28 @@ async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+  // The request target is split by hand (perf.ts): the URL constructor
+  // costs a parse per request, and the query string is only parsed when a
+  // route actually reads it (REST and git) — healthz, GraphQL and MCP
+  // never touch it.
+  const target = parseRequestTarget(req.url ?? '/');
+  const pathname = target.pathname;
   const baseUrl = `http://${req.headers.host ?? 'localhost'}`;
   const method = req.method ?? 'GET';
-  const segments = url.pathname.split('/').filter((part) => part !== '');
-  const query = url.searchParams;
+  const segments = pathname.split('/').filter((part) => part !== '');
   // A request that cannot carry a body must not wait for the stream's
   // `end` event: that wait is a whole event-loop turn per request.
   const bodyless = isBodylessRequest(req);
 
   try {
     // -- health --------------------------------------------------------------
-    if (method === 'GET' && url.pathname === '/healthz') {
+    if (method === 'GET' && pathname === '/healthz') {
       sendJson(res, 200, { status: 'ok' });
       return;
     }
 
     // -- GraphQL --------------------------------------------------------------
-    if (url.pathname === '/api/graphql') {
+    if (pathname === '/api/graphql') {
       if (method !== 'POST') throw new ApiError(404, 'Not Found');
       if (!authorized(req, expectedToken, expectedBearer)) {
         sendUnauthorized(res);
@@ -181,7 +189,7 @@ async function handleRequest(
     }
 
     // -- MCP ------------------------------------------------------------------
-    if (url.pathname === '/mcp') {
+    if (pathname === '/mcp') {
       if (!authorized(req, expectedToken, expectedBearer)) {
         sendUnauthorized(res);
         return;
@@ -199,6 +207,7 @@ async function handleRequest(
 
     // -- REST -----------------------------------------------------------------
     if (segments[0] === 'api' && segments[1] === 'v3') {
+      const query = new URLSearchParams(target.search);
       const restSegments = segments.slice(2);
       const isRoot = restSegments.length === 0;
       const isMeta = restSegments.length === 1 && restSegments[0] === 'meta';
@@ -208,7 +217,7 @@ async function handleRequest(
       }
       const raw = bodyless ? EMPTY_BODY : await readBody(req);
       const body = parseJsonBody(raw);
-      const answer = handleRest(store, method, restSegments, query, body, baseUrl, url.pathname);
+      const answer = handleRest(store, method, restSegments, query, body, baseUrl, pathname);
       if (answer.status === 204) {
         res.writeHead(204, { 'x-github-request-id': requestId() });
         res.end();
@@ -231,6 +240,7 @@ async function handleRequest(
       const owner = segments[0]!;
       const repoName = segments[1]!.slice(0, -'.git'.length);
       const subpath = segments.slice(2).join('/');
+      const query = new URLSearchParams(target.search);
       const headers: Record<string, string | undefined> = {
         'git-protocol': req.headers['git-protocol'],
       };

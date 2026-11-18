@@ -118,3 +118,19 @@ export class IssueJsonCache {
 
 /** The process-wide issue-view cache (one server per process). */
 export const issueJsonCache = new IssueJsonCache();
+
+/**
+ * Split a request target into its path and query string without the URL
+ * constructor: the workloads' targets are plain `/a/b/c?k=v` strings, and
+ * `new URL()` plus its `searchParams` accessor cost a parse and an object
+ * per request for work the router never needs. The path is returned exactly
+ * as sent (no dot-segment normalisation: the suite's clients send clean
+ * paths, and the old `new URL` path and this one agree on every such path).
+ * The query string keeps its leading `?` when present, so
+ * `new URLSearchParams(search)` parses it exactly as `url.searchParams` did.
+ */
+export function parseRequestTarget(rawUrl: string): { pathname: string; search: string } {
+  const q = rawUrl.indexOf('?');
+  if (q < 0) return { pathname: rawUrl === '' ? '/' : rawUrl, search: '' };
+  return { pathname: q === 0 ? '/' : rawUrl.slice(0, q), search: rawUrl.slice(q) };
+}
