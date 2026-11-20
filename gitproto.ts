@@ -126,6 +126,13 @@ interface CachedFetch {
   pack: Buffer;
   shallow: string[];
   unshallow: string[];
+  /**
+   * The fully-assembled v2 pack section (shallow-info + packfile + sideband
+   * + flush) for this entry, built once. Only the v2 path uses it; v0
+   * responses frame the same pack differently, so entries built by a v0
+   * fetch leave this undefined and the v2 path fills it in on first use.
+   */
+  response?: Buffer;
 }
 
 const FETCH_CACHE_MAX = 16;
@@ -167,16 +174,61 @@ function repoRefLines(repo: Repo): Array<{ oid: string; name: string; peeled?: s
   return lines;
 }
 
-/** The v2 capability advertisement. */
+/**
+ * The v2 capability advertisement. Constant: the v2 advertisement carries no
+ * repo state at all (no refs, no capabilities that vary), so it is built
+ * once and shared by every info/refs request.
+ */
+const ADVERTISEMENT_V2: Buffer = Buffer.concat([
+  pkt('version 2\n'),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow wait-for-done filter\n'),
+  pkt('object-format=sha1\n'),
+  pkt(`agent=${AGENT}\n`),
+  FLUSH,
+]);
+
 function advertisementV2(): Buffer {
-  return Buffer.concat([
-    pkt('version 2\n'),
-    pkt('ls-refs=unborn\n'),
-    pkt('fetch=shallow wait-for-done filter\n'),
-    pkt('object-format=sha1\n'),
-    pkt(`agent=${AGENT}\n`),
-    FLUSH,
-  ]);
+  return ADVERTISEMENT_V2;
+}
+
+/**
+ * Fingerprint of the ref state a git response depends on. Derived from
+ * repoRefLines (sorted, peeled), so ANY ref change (push, branch/tag
+ * create/delete, peeled target change) changes the key; object-store growth
+ * that does not move a ref leaves it unchanged. Building it is a cheap
+ * string join over the (few) refs; the expensive part it avoids is the
+ * per-request pkt()/Buffer.concat response assembly.
+ */
+function fingerprintFromLines(refs: ReadonlyArray<{ oid: string; name: string; peeled?: string }>): string {
+  let out = '';
+  for (const ref of refs) out += `${ref.oid} ${ref.name}${ref.peeled !== undefined ? `^${ref.peeled}` : ''};`;
+  return out;
+}
+
+function refsFingerprint(repo: Repo): string {
+  return fingerprintFromLines(repoRefLines(repo));
+}
+
+/**
+ * Cache of fully-assembled ref-dependent git responses (v0 advertisements,
+ * ls-refs). Keyed by refs fingerprint + the request inputs that shape the
+ * response, so a stale entry is impossible without a fingerprint change.
+ * Bounded FIFO like the fetch cache.
+ */
+const REF_RESPONSE_CACHE_MAX = 64;
+const refResponseCache = new Map<string, Buffer>();
+
+function refResponseCacheGet(key: string): Buffer | undefined {
+  return refResponseCache.get(key);
+}
+
+function refResponseCacheSet(key: string, value: Buffer): void {
+  if (refResponseCache.size >= REF_RESPONSE_CACHE_MAX) {
+    const oldest = refResponseCache.keys().next().value;
+    if (oldest !== undefined) refResponseCache.delete(oldest);
+  }
+  refResponseCache.set(key, value);
 }
 
 /** The v0 advertisement for one service. */
@@ -184,9 +236,12 @@ function advertisementV0(
   service: 'git-upload-pack' | 'git-receive-pack',
   repo: Repo,
 ): Buffer {
+  const refs = repoRefLines(repo);
+  const key = `v0|${service}|${fingerprintFromLines(refs)}`;
+  const hit = refResponseCacheGet(key);
+  if (hit !== undefined) return hit;
   const caps = service === 'git-upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_CAPS;
   const parts: Buffer[] = [pkt(`# service=${service}\n`), FLUSH];
-  const refs = repoRefLines(repo);
   const mainTip = repo.refs.get('refs/heads/main');
   if (refs.length === 0) {
     parts.push(pkt(`${ZERO_OID} capabilities^{}\u0000${caps}\n`));
@@ -199,7 +254,9 @@ function advertisementV0(
     }
   }
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  refResponseCacheSet(key, body);
+  return body;
 }
 
 // ---------------------------------------------------------------------------
@@ -430,8 +487,11 @@ function lsRefsResponse(
   repo: Repo,
   request: UploadRequest,
 ): Buffer {
-  const parts: Buffer[] = [];
   const refs = repoRefLines(repo);
+  const key = `ls-refs|${fingerprintFromLines(refs)}|peel=${request.peel}|symrefs=${request.symrefs}|unborn=${request.unborn}|${request.prefixes.join(',')}`;
+  const hit = refResponseCacheGet(key);
+  if (hit !== undefined) return hit;
+  const parts: Buffer[] = [];
   const keep = (name: string): boolean =>
     request.prefixes.length === 0 || request.prefixes.some((prefix) => name.startsWith(prefix));
   // The HEAD pseudo-ref is only listed when the request asks for it: with
@@ -452,6 +512,29 @@ function lsRefsResponse(
     if (request.peel && ref.peeled !== undefined) line += ` peeled:${ref.peeled}`;
     parts.push(pkt(`${line}\n`));
   }
+  parts.push(FLUSH);
+  const body = Buffer.concat(parts);
+  refResponseCacheSet(key, body);
+  return body;
+}
+
+/**
+ * Assemble the pack section of a v2 fetch response (shallow-info + packfile
+ * + sideband + flush). Pure function of (pack, shallow, unshallow), so the
+ * result is cached in the fetch entry. The ACK prelude for a multi-round
+ * fetch (hasHaves && !done) is NOT part of it: it is prepended by the
+ * caller when present.
+ */
+function assembleFetchV2Response(pack: Buffer, shallow: string[], unshallow: string[]): Buffer {
+  const parts: Buffer[] = [];
+  if (shallow.length > 0 || unshallow.length > 0) {
+    parts.push(pkt('shallow-info\n'));
+    for (const oid of shallow) parts.push(pkt(`shallow ${oid}`));
+    for (const oid of unshallow) parts.push(pkt(`unshallow ${oid}`));
+    parts.push(DELIM);
+  }
+  parts.push(pkt('packfile\n'));
+  for (const packet of sidebandPackets(pack)) parts.push(packet);
   parts.push(FLUSH);
   return Buffer.concat(parts);
 }
@@ -504,19 +587,19 @@ function fetchV2Response(
   let cached = fetchCacheGet(cacheKey);
   if (cached === undefined) {
     const plan = planFetch(store, repo, request.wants, request.haves, request.shallow, request.depth);
-    cached = { pack: buildFetchPack(repo, plan.send), shallow: plan.shallow, unshallow: plan.unshallow };
+    const pack = buildFetchPack(repo, plan.send);
+    cached = { pack, shallow: plan.shallow, unshallow: plan.unshallow, response: assembleFetchV2Response(pack, plan.shallow, plan.unshallow) };
     fetchCacheSet(cacheKey, cached);
+  } else if (cached.response === undefined) {
+    // Entry built by a v0 fetch with the same key (pack is protocol-free);
+    // frame it for v2 once and keep it for later v2 requests.
+    cached.response = assembleFetchV2Response(cached.pack, cached.shallow, cached.unshallow);
   }
-  if (cached.shallow.length > 0 || cached.unshallow.length > 0) {
-    parts.push(pkt('shallow-info\n'));
-    for (const oid of cached.shallow) parts.push(pkt(`shallow ${oid}`));
-    for (const oid of cached.unshallow) parts.push(pkt(`unshallow ${oid}`));
-    parts.push(DELIM);
-  }
-  parts.push(pkt('packfile\n'));
-  for (const packet of sidebandPackets(cached.pack)) parts.push(packet);
-  parts.push(FLUSH);
-  return Buffer.concat(parts);
+  // No ACK prelude in `parts` (single-round fetch, or haves already done):
+  // the cached assembly is the whole answer.
+  if (parts.length === 0) return cached.response;
+  // Multi-round fetch with an ACK prelude already in `parts`: prepend it.
+  return Buffer.concat([Buffer.concat(parts), cached.response]);
 }
 
 /** The v0 fetch answer: shallow lines, ACK/NAK, sideband pack, flush. */
